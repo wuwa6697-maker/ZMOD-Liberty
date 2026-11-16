@@ -812,6 +812,10 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
 #if REX_PLATFORM_ANDROID
 // Off by default: on the Adreno 650 handheld it made the pinned threads faster
 // but not the frame rate (the GPU and the recorder bound it).
+// Defined in android/android_thread_pinning.cpp (default on: 4 threads on the
+// big Cortex-A725 cores). It supersedes the hot-thread pinner below.
+REXCVAR_DECLARE(uint32_t, gta4_thread_pinning);
+
 REXCVAR_DEFINE_BOOL(android_pin_hot_threads, false, "GTA IV/Performance",
                     "Keep the busiest threads (renderer stages, game logic) on the big CPU cores");
 
@@ -927,6 +931,13 @@ void StartHotThreadPinning() {
     };
     for (;;) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
+      // gta4_thread_pinning owns thread affinity when enabled; two pinners
+      // would overwrite each other's masks. Drop our state, touch nothing.
+      if (REXCVAR_GET(gta4_thread_pinning) > 0) {
+        pinned.clear();
+        last_ticks.clear();
+        continue;
+      }
       if (!REXCVAR_GET(android_pin_hot_threads)) {
         for (pid_t tid : pinned) set_affinity(tid, all);
         pinned.clear();

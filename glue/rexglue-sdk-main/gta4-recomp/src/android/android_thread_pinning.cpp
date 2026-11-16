@@ -9,6 +9,13 @@
 // remaining cores. Threads are re-ranked continuously, so roles that move
 // between threads (loading, cutscenes) follow.
 //
+// Default is ON (4 threads): tuned for the Dimensity 8500 Ultra (POCO X8 Pro),
+// 8x Cortex-A725 in three tiers (1x 3.4 GHz prime, 3x 3.2 GHz, 4x 2.2 GHz).
+// The four fastest cores take the four busiest threads, the 2.2 GHz cores take
+// everything else. Cores are ranked by max frequency, then cpu_capacity, then
+// highest cpu index (the fast cores are the high indices on MediaTek), so the
+// order stays right even if cpufreq nodes are unreadable.
+//
 // Audio threads (ours at nice -16, AAudio's realtime callback) are never
 // confined: on the leftover cores they compete with streaming and loading,
 // and the little cores alone cannot decode XMA through a load spike.
@@ -24,15 +31,16 @@
 #include <cstring>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <android/log.h>
 
 #include <rex/cvar.h>
 
-REXCVAR_DEFINE_UINT32(gta4_thread_pinning, 0, "GTA IV/Performance",
+REXCVAR_DEFINE_UINT32(gta4_thread_pinning, 4, "GTA IV/Performance",
                       "Give the N busiest threads a big core each and keep the others off them "
-                      "(0 = leave scheduling to Android)")
+                      "(0 = leave scheduling to Android, default 4 = Dimensity 8500 big cores)")
     .range(0, 4);
 
 namespace {
@@ -70,23 +78,36 @@ ThreadStat ReadThreadStat(pid_t tid) {
   return {utime + stime, nice <= -16 ||policy == 1 || policy == 2};
 }
 
+long ReadCpuLong(int cpu, const char* leaf) {
+  char path[112];
+  std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/%s", cpu, leaf);
+  long value = 0;
+  if (FILE* file = std::fopen(path, "r")) {
+    if (std::fscanf(file, "%ld", &value) != 1) value = 0;
+    std::fclose(file);
+  }
+  return value;
+}
+
+// Fastest first: max frequency, then cpu_capacity, then the higher cpu index.
 std::vector<int> CoresByMaxFrequency() {
-  std::vector<std::pair<long, int>> cores;
+  struct Core {
+    long frequency, capacity;
+    int cpu;
+  };
+  std::vector<Core> cores;
   const long count = sysconf(_SC_NPROCESSORS_CONF);
   for (int cpu = 0; cpu < count && cpu < CPU_SETSIZE; ++cpu) {
-    char path[96];
-    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
-    long frequency = 0;
-    if (FILE* file = std::fopen(path, "r")) {
-      if (std::fscanf(file, "%ld", &frequency) != 1) frequency = 0;
-      std::fclose(file);
-    }
-    cores.emplace_back(frequency, cpu);
+    cores.push_back({ReadCpuLong(cpu, "cpufreq/cpuinfo_max_freq"),
+                     ReadCpuLong(cpu, "cpu_capacity"), cpu});
   }
-  std::stable_sort(cores.begin(), cores.end(),
-                   [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::sort(cores.begin(), cores.end(), [](const Core& a, const Core& b) {
+    if (a.frequency != b.frequency) return a.frequency > b.frequency;
+    if (a.capacity != b.capacity) return a.capacity > b.capacity;
+    return a.cpu > b.cpu;
+  });
   std::vector<int> result;
-  for (const auto& [frequency, cpu] : cores) result.push_back(cpu);
+  for (const Core& core : cores) result.push_back(core.cpu);
   return result;
 }
 
@@ -98,10 +119,13 @@ void PinningLoop() {
   const std::vector<int> cores = CoresByMaxFrequency();
   if (cores.size() < 6) return;
   std::unordered_map<pid_t, uint64_t> previous;
+  std::unordered_set<pid_t> held;  // threads on a dedicated core in the last pass
   uint32_t applied = 0;
   for (;;) {
     std::this_thread::sleep_for(std::chrono::seconds(2));
-    const uint32_t pinned = std::min<uint32_t>(REXCVAR_GET(gta4_thread_pinning), 4);
+    // Never take more than half of the cores: the rest must stay for the others.
+    const uint32_t pinned = std::min<uint32_t>(
+        {REXCVAR_GET(gta4_thread_pinning), 4u, uint32_t(cores.size() / 2)});
     std::vector<std::pair<uint64_t, pid_t>> usage;
     std::vector<pid_t> audio;
     std::unordered_map<pid_t, uint64_t> current;
@@ -117,8 +141,11 @@ void PinningLoop() {
           continue;
         }
         const auto old = previous.find(tid);
-        usage.emplace_back(old != previous.end() && ticks >= old->second ? ticks - old->second : 0,
-                           tid);
+        uint64_t delta = old != previous.end() && ticks >= old->second ? ticks - old->second : 0;
+        // Hysteresis: a pinned thread keeps its core unless overtaken by 25%+,
+        // so threads are not migrated back and forth between cores.
+        if (held.count(tid)) delta += delta / 4;
+        usage.emplace_back(delta, tid);
       }
       closedir(directory);
     }
@@ -128,6 +155,7 @@ void PinningLoop() {
     cpu_set_t rest;
     CPU_ZERO(&rest);
     for (size_t i = pinned; i < cores.size(); ++i) CPU_SET(cores[i], &rest);
+    held.clear();
     for (size_t i = 0; i < usage.size(); ++i) {
       cpu_set_t set;
       CPU_ZERO(&set);
@@ -135,6 +163,7 @@ void PinningLoop() {
         for (int cpu : cores) CPU_SET(cpu, &set);
       } else if (i < pinned) {
         CPU_SET(cores[i], &set);
+        held.insert(usage[i].second);
       } else {
         set = rest;
       }
@@ -145,8 +174,8 @@ void PinningLoop() {
     for (int cpu : cores) CPU_SET(cpu, &all);
     for (pid_t tid : audio) SetAffinity(tid, all);
     if (pinned != applied) {
-      __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "thread-pinning: %u threads on cores %d,%d,%d",
-                          pinned, cores[0], cores[1], cores[2]);
+      __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "thread-pinning: %u threads on cores %d,%d,%d,%d",
+                          pinned, cores[0], cores[1], cores[2], cores[3]);
     }
     applied = pinned;
   }

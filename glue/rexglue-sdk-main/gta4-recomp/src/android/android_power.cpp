@@ -20,11 +20,15 @@
 // thermal headroom Android 11) and need the device's power and thermal HALs;
 // without them the hints are skipped.
 #include <dirent.h>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -98,6 +102,39 @@ Api LoadApi() {
   return api;
 }
 
+// ---- Dimensity 8500 Ultra (8x Cortex-A725: 1x3.4 + 3x3.2 + 4x2.2 GHz) -------
+// The "fast" cores are every core above the slowest tier: 4 on the 8500, the
+// same four android_thread_pinning.cpp dedicates to the busiest threads. The
+// frequency is read from cpufreq, then cpu_capacity; if neither is readable the
+// 8500's 4 is assumed. Clamped to [2, 6] so other layouts stay reasonable.
+long ReadCpuValue(int cpu, const char* leaf) {
+  char path[112];
+  std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/%s", cpu, leaf);
+  long value = 0;
+  if (FILE* file = std::fopen(path, "r")) {
+    if (std::fscanf(file, "%ld", &value) != 1) value = 0;
+    std::fclose(file);
+  }
+  return value;
+}
+
+size_t FastCoreCount() {
+  static const size_t count = [] {
+    for (const char* leaf : {"cpufreq/cpuinfo_max_freq", "cpu_capacity"}) {
+      std::vector<long> values;
+      const long cpus = sysconf(_SC_NPROCESSORS_CONF);
+      for (int cpu = 0; cpu < cpus && cpu < 64; ++cpu) values.push_back(ReadCpuValue(cpu, leaf));
+      if (values.empty() || std::count(values.begin(), values.end(), 0L)) continue;
+      const long slowest = *std::min_element(values.begin(), values.end());
+      const size_t fast = size_t(std::count_if(values.begin(), values.end(),
+                                               [&](long v) { return v > slowest; }));
+      if (fast) return std::clamp<size_t>(fast, 2, 6);
+    }
+    return size_t(4);
+  }();
+  return count;
+}
+
 // CPU time a thread of this process has used (CPUCLOCK_SCHED, per thread).
 int64_t ThreadCpuNanoseconds(pid_t tid) {
   const clockid_t clock = clockid_t((~unsigned(tid) << 3) | 6u);
@@ -107,15 +144,54 @@ int64_t ThreadCpuNanoseconds(pid_t tid) {
 }
 
 // The busiest threads over the last interval, by CPU time.
-// Adreno GPU temperature in degrees C (kgsl reports millidegrees); NaN if absent.
-float GpuTemperature() {
+// GPU temperature in degrees C; NaN if absent. Adreno: kgsl (millidegrees).
+// Mali/MediaTek: the first thermal zone whose type contains "gpu" (found once).
+float ReadMilliDegrees(const char* path) {
   float value = __builtin_nanf("");
-  if (FILE* file = std::fopen("/sys/class/kgsl/kgsl-3d0/temp", "r")) {
+  if (FILE* file = std::fopen(path, "r")) {
     long raw = 0;
     if (std::fscanf(file, "%ld", &raw) == 1) value = raw > 1000 ? float(raw) / 1000.0f : float(raw);
     std::fclose(file);
   }
   return value;
+}
+
+float GpuTemperature() {
+  float value = ReadMilliDegrees("/sys/class/kgsl/kgsl-3d0/temp");
+  if (value == value) return value;
+  static const std::string zone = [] {
+    for (int index = 0; index < 64; ++index) {
+      char type_path[96];
+      std::snprintf(type_path, sizeof(type_path), "/sys/class/thermal/thermal_zone%d/type", index);
+      std::ifstream file(type_path);
+      std::string type;
+      if (!std::getline(file, type)) continue;
+      for (char& c : type) c = char(std::tolower(static_cast<unsigned char>(c)));
+      if (type.find("gpu") != std::string::npos) {
+        return "/sys/class/thermal/thermal_zone" + std::to_string(index) + "/temp";
+      }
+    }
+    return std::string();
+  }();
+  return zone.empty() ? value : ReadMilliDegrees(zone.c_str());
+}
+
+// Audio threads (nice <= -16 or realtime) are left on every core by the pinner.
+bool IsAudioThread(pid_t tid) {
+  char path[64];
+  std::snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+  std::ifstream file(path);
+  std::string stat((std::istreambuf_iterator<char>(file)), {});
+  const size_t name_end = stat.rfind(')');
+  if (name_end == std::string::npos) return false;
+  std::istringstream fields(stat.substr(name_end + 2));
+  std::string field;
+  long nice = 0, policy = 0;
+  for (int index = 3; index <= 41 && fields >> field; ++index) {
+    if (index == 19) nice = std::strtol(field.c_str(), nullptr, 10);
+    if (index == 41) policy = std::strtol(field.c_str(), nullptr, 10);
+  }
+  return nice <= -16 || policy == 1 || policy == 2;
 }
 
 std::vector<pid_t> BusiestThreads(std::unordered_map<pid_t, int64_t>& previous, size_t count) {
@@ -125,6 +201,7 @@ std::vector<pid_t> BusiestThreads(std::unordered_map<pid_t, int64_t>& previous, 
     while (dirent* entry = readdir(directory)) {
       const pid_t tid = pid_t(std::atoi(entry->d_name));
       if (tid <= 0) continue;
+      if (IsAudioThread(tid)) continue;  // not pinned to the fast cores, not boosted with them
       const int64_t time = ThreadCpuNanoseconds(tid);
       if (time < 0) continue;
       current[tid] = time;
@@ -188,7 +265,7 @@ void PowerLoop() {
 
     if (now >= next_rank) {
       next_rank = now + kRankInterval;
-      const std::vector<pid_t> busiest = BusiestThreads(rank_times, 4);
+      const std::vector<pid_t> busiest = BusiestThreads(rank_times, std::min<size_t>(FastCoreCount(), 4));
       if (enabled && busiest != threads) {
         if (session) api.close_session(session);
         session = nullptr;

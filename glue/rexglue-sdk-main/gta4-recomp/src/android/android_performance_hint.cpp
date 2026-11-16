@@ -20,6 +20,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <cstdio>
+
 #include <android/log.h>
 
 #include <rex/cvar.h>
@@ -41,9 +43,45 @@ constexpr int64_t kMaxFrameNs = 4 * 33'333'333;  // clamp for pauses and loading
 int64_t TargetFrameNs() {
   return int64_t(std::clamp<uint32_t>(REXCVAR_GET(android_performance_hint_target_ms), 10, 50)) * 1'000'000;
 }
-constexpr size_t kMaxHintThreads = 6;
 // CPU ticks (100 per second) a thread needs in one second to count as busy.
 constexpr uint64_t kBusyTicks = 10;
+
+// ---- Dimensity 8500 Ultra (8x Cortex-A725: 1x3.4 + 3x3.2 + 4x2.2 GHz) -------
+// The "fast" cores are every core above the slowest tier: 4 on the 8500, the
+// same four android_thread_pinning.cpp dedicates to the busiest threads. The
+// frequency is read from cpufreq, then cpu_capacity; if neither is readable the
+// 8500's 4 is assumed. Clamped to [2, 6] so other layouts stay reasonable.
+long ReadCpuValue(int cpu, const char* leaf) {
+  char path[112];
+  std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/%s", cpu, leaf);
+  long value = 0;
+  if (FILE* file = std::fopen(path, "r")) {
+    if (std::fscanf(file, "%ld", &value) != 1) value = 0;
+    std::fclose(file);
+  }
+  return value;
+}
+
+size_t FastCoreCount() {
+  static const size_t count = [] {
+    for (const char* leaf : {"cpufreq/cpuinfo_max_freq", "cpu_capacity"}) {
+      std::vector<long> values;
+      const long cpus = sysconf(_SC_NPROCESSORS_CONF);
+      for (int cpu = 0; cpu < cpus && cpu < 64; ++cpu) values.push_back(ReadCpuValue(cpu, leaf));
+      if (values.empty() || std::count(values.begin(), values.end(), 0L)) continue;
+      const long slowest = *std::min_element(values.begin(), values.end());
+      const size_t fast = size_t(std::count_if(values.begin(), values.end(),
+                                               [&](long v) { return v > slowest; }));
+      if (fast) return std::clamp<size_t>(fast, 2, 6);
+    }
+    return size_t(4);
+  }();
+  return count;
+}
+
+// One hinted thread per fast core: the busiest threads are the ones the thread
+// pinner keeps on them, so the system boosts exactly those cores.
+size_t MaxHintThreads() { return FastCoreCount(); }
 
 std::mutex g_frames_mutex;
 std::vector<int64_t> g_frame_durations;  // filled by NoteTitleFrame
@@ -110,11 +148,17 @@ class BusyThreads {
         std::istringstream fields(stat.substr(name_end + 2));
         std::string field;
         uint64_t utime = 0, stime = 0;
-        for (int index = 3; index <= 15 && fields >> field; ++index) {
+        long nice = 0, policy = 0;
+        for (int index = 3; index <= 41 && fields >> field; ++index) {
           if (index == 14) utime = std::strtoull(field.c_str(), nullptr, 10);
           if (index == 15) stime = std::strtoull(field.c_str(), nullptr, 10);
+          if (index == 19) nice = std::strtol(field.c_str(), nullptr, 10);
+          if (index == 41) policy = std::strtol(field.c_str(), nullptr, 10);
         }
         ticks[tid] = utime + stime;
+        // Audio threads (nice <= -16, realtime) are not pinned to the fast
+        // cores and must not be boosted with them.
+        if (nice <= -16 || policy == 1 || policy == 2) continue;
         const auto last = last_ticks_.find(tid);
         if (last != last_ticks_.end() && utime + stime - last->second >= kBusyTicks) {
           busy.emplace_back(utime + stime - last->second, tid);
@@ -126,7 +170,7 @@ class BusyThreads {
     std::sort(busy.begin(), busy.end(), std::greater<>());
     std::vector<pid_t> result;
     for (const auto& [delta, tid] : busy) {
-      if (result.size() == kMaxHintThreads) break;
+      if (result.size() == MaxHintThreads()) break;
       result.push_back(tid);
     }
     std::sort(result.begin(), result.end());
@@ -209,7 +253,7 @@ void StartPerformanceHint() {
         if (!hot.empty()) {
           std::vector<pid_t> merged = hot;
           for (pid_t tid : threads) {
-            if (merged.size() >= kMaxHintThreads) break;
+            if (merged.size() >= MaxHintThreads()) break;
             if (std::find(merged.begin(), merged.end(), tid) == merged.end() &&
                 access(("/proc/self/task/" + std::to_string(tid)).c_str(), F_OK) == 0) {
               merged.push_back(tid);
